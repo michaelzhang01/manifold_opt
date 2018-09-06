@@ -2,13 +2,14 @@
 """
 Created on Mon Apr 09 23:14:43 2018
 
-Parallel Gradient Descent for Spheres
+Parallel Extrinsic Mean Gradient Descent for Spheres
 
 @author: Michael Zhang
 """
 
 #import datetime
-#import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
 #import os
 from mpi4py import MPI
@@ -17,7 +18,9 @@ from mpi4py import MPI
 #from scipy import stats
 from scipy.optimize import minimize
 #import pdb
-np.random.seed(8888)
+import time
+
+#np.random.seed(8888)
 
 def pi_logistic_map(x, grad_length):
     log_map = ((2.*np.pi/grad_length) / (1.+  np.exp(-x)))  - (np.pi/grad_length)
@@ -33,11 +36,13 @@ def exp_map(theta, v):
         return(return_map)
 
 class SphereOptimization(object):
-    def __init__(self, X, iters=1000):
+    def __init__(self, X, iters=1000, verbose=1):
         self.iters = int(iters)
         self.comm = MPI.COMM_WORLD
         self.P = self.comm.Get_size()
         self.rank = self.comm.Get_rank()
+        self.verbose = int(verbose)
+
         if self.rank == 0:
             self.X = X
             self.V_N = self.X.sum(axis=0)
@@ -70,7 +75,7 @@ class SphereOptimization(object):
         self.theta = self.comm.bcast(self.theta)
 
     def local_loss(self, theta):
-        return(np.linalg.norm(self.V_p-theta))
+        return(np.linalg.norm(self.V_p-theta)**2)
 
     def local_loss_grad(self,theta):
         grad = (2. / float(self.N_p))*( (np.dot(self.V_p, theta)*theta) - self.V_p )
@@ -80,29 +85,10 @@ class SphereOptimization(object):
         grad = (2. / float(self.N))*( (np.dot(self.V_N, theta)*theta) - self.V_N)
         return(grad)
 
-    def surrogate_loss(self, theta, theta_1):
-        theta_dot = np.dot(theta,theta_1)
-        loss = (2.*np.arccos(theta_dot) / (self.N_p*np.sqrt(1-theta_dot**2)))
-        prod_term = np.dot(((self.V_N/float(self.P)) - self.V_p),theta_1)*theta_1
-        prod_term -=((self.V_N/float(self.P)) - self.V_p)
-        loss *= np.dot(theta, prod_term)
-        loss += self.local_loss(theta)
-        return(loss)
 
     def surrogate_grad_zero(self,theta):
         grad = (2. / float(self.N_p))* ((np.dot((self.V_N/float(self.P)),theta)*theta) -  (self.V_N/float(self.P)))
         return(grad)
-
-    def surrogate_loss2(self, theta):
-        V_subtract = ((self.V_N/float(self.P)) - self.V_p)
-        V_theta_s = np.dot(V_subtract, self.theta)*self.theta
-        V_sub_term = V_theta_s - V_subtract
-        theta_dot = np.dot(theta,self.theta)
-        sqrt_term = np.sqrt(1.-(theta_dot**2))
-        K_1 = (2.*np.arccos(theta_dot)) / (self.N_p*sqrt_term )
-        loss = self.local_loss(theta)
-        loss += K_1 * np.dot(theta,V_sub_term)
-        return(loss)
 
     def surrogate_grad(self,theta_new, theta_old):
         V_subtract = ((self.V_N/float(self.P)) - self.V_p)
@@ -136,12 +122,16 @@ class SphereOptimization(object):
 
 
     def extrinsic_opt(self):
+        start_time = time.time()
+
         # print initial value
         if self.rank ==0:
-            print("%i\t%i\t%.2f\t%s"%(0, 0, 0, self.theta[0]))
+            if self.verbose >=2:
+                print("%i\t%i\t%.2f\t%s"%(0, 0, 0, self.theta[0]))
 
         for it in xrange(1,self.iters):
             current_proc = it % int(self.P) # select processor
+#            current_proc = 0
             if self.rank == current_proc:
                 if it == 1:
                     theta_grad = self.surrogate_grad_zero(self.theta[it-1])
@@ -150,7 +140,8 @@ class SphereOptimization(object):
                 min_lambda =  pi_logistic_map(minimize(self.lambda_obj,x0=-.5,args=(it,)).x,np.linalg.norm(theta_grad))
                 self.theta[it] = exp_map(self.theta[it-1], min_lambda*theta_grad)
                 self.theta[it] /= np.linalg.norm(self.theta[it]) # ensure norm of current theta is 1
-                print("%i\t%i\t%.2f\t%s"%(it, current_proc, min_lambda, self.theta[it]))
+                if self.verbose >=2:
+                    print("%i\t%i\t%.2f\t%s"%(it, current_proc, min_lambda, self.theta[it]))
             self.comm.barrier()
             self.theta = self.comm.bcast(self.theta, current_proc)
 
@@ -161,12 +152,34 @@ class SphereOptimization(object):
                 self.theta = self.comm.bcast(self.theta, current_proc)
                 break
 
-        if self.rank ==0:
-            print("RMSE: %f\tExtrinsic Mean: %s" % (np.sqrt(np.mean((self.theta[-1]-self.extrinsic_mean)**2)),self.extrinsic_mean))
+        if self.verbose >= 1:
+            self.final_theta = self.theta[-1]
+            self.RMSE = np.sqrt(np.mean((self.final_theta-self.extrinsic_mean)**2))
+            end_time = time.time() - start_time
+            X_gather = self.comm.gather(self.X_local)
+            if self.rank==0:
+                X_gather = np.vstack(X_gather)
+                print("%i\t%.2f\t%s" % (self.P, end_time, self.RMSE))
+                f,a = plt.subplots(1,1)
 
 
 if __name__ == '__main__':
-    X=np.random.vonmises( [.5,-2,-1.,7], kappa = [2,2,2,2],size=(10000000,4))
-    X /=np.linalg.norm(X,axis=0)
-    sph = SphereOptimization(X)
-    sph.extrinsic_opt()
+    comm = MPI.COMM_WORLD
+    base_seed =88888
+    np.random.seed(base_seed)
+    trials = 20
+    D = 100
+    if comm.Get_rank() == 0:
+#        X=np.random.vonmises( np.random.normal(size=D), kappa = [2]*D,size=(int(1e4),D))
+        X=np.random.normal( np.random.normal(size=D), scale = [2]*D,size=(int(1e6),D))
+        X_norm = np.linalg.norm(X,axis=1)
+        X= np.vstack([X[i]/x_n for i,x_n in enumerate(X_norm)])
+    else:
+        X = None
+    for t in xrange(trials):
+        np.random.seed(base_seed + t)
+        sph = SphereOptimization(X,verbose=1)
+        sph.extrinsic_opt()
+#    sph = SphereOptimization(X)
+#    sph.extrinsic_opt()
+
